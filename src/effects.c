@@ -92,6 +92,7 @@
 #define JackPortIsControlVoltage 0x100
 
 /* Local */
+#include "atom-writer.h"
 #include "effects.h"
 #include "monitor.h"
 #include "socket.h"
@@ -443,6 +444,9 @@ static cc_client_t *g_cc_client = NULL;
 static assignment_t g_assignments_list[CC_MAX_DEVICES][CC_MAX_ASSIGNMENTS];
 #endif
 
+static jack_ringbuffer_t* g_atom_to_gui_rb;
+static pthread_mutex_t    g_atom_to_gui_mutex;
+
 static struct list_head g_rtsafe_list;
 static RtMemPool_Handle g_rtsafe_mem_pool;
 static pthread_mutex_t  g_rtsafe_mutex;
@@ -532,6 +536,7 @@ static void GetFeatures(effect_t *effect);
 static property_t *FindEffectPropertyByLabel(effect_t *effect, const char *label);
 static port_t *FindEffectInputPortBySymbol(effect_t *effect, const char *control_symbol);
 static port_t *FindEffectOutputPortBySymbol(effect_t *effect, const char *control_symbol);
+static port_t *FindEffectOutputAtomPortBySymbol(effect_t *effect, const char *control_symbol);
 static const void* GetPortValueForState(const char* symbol, void* user_data, uint32_t* size, uint32_t* type);
 static int LoadPresets(effect_t *effect);
 static void FreeFeatures(effect_t *effect);
@@ -679,6 +684,21 @@ static void RunPostPonedEvents(int ignored_effect_id)
     list_splice_init(&g_rtsafe_list, &queue);
     pthread_mutex_unlock(&g_rtsafe_mutex);
 
+    while (jack_ringbuffer_read_space(g_atom_to_gui_rb) > sizeof(size_t))
+    {
+        size_t sz;
+        jack_ringbuffer_peek(g_atom_to_gui_rb, (char *)&sz, sizeof(size_t));
+        if (jack_ringbuffer_read_space(g_atom_to_gui_rb) < sizeof(size_t) + sz) {
+            break;
+        }
+        jack_ringbuffer_read_advance(g_atom_to_gui_rb, sizeof(size_t));
+        assert(sz < MAX_ATOM_JSON);
+
+        static char msg[MAX_ATOM_JSON];
+        jack_ringbuffer_read(g_atom_to_gui_rb, msg, sz);
+        socket_send_feedback(msg);
+    }
+
     if (list_empty(&queue))
     {
         // nothing to do
@@ -704,7 +724,7 @@ static void RunPostPonedEvents(int ignored_effect_id)
     INIT_LIST_HEAD(&cached_param_set.symbols.siblings);
     INIT_LIST_HEAD(&cached_output_mon.symbols.siblings);
 
-    // itenerate backwards
+    // iterate backwards
     struct list_head *it, *it2;
     postponed_event_list_data* eventptr;
 
@@ -1207,9 +1227,10 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
             if ((effect->output_control_ports[i]->hints & HINT_MONITORED) == 0)
                 continue;
 
-            value = *(effect->output_control_ports[i]->buffer);
+            port_t *port = effect->output_control_ports[i];
+            value = *(port->buffer);
 
-            if (! floats_differ_enough(effect->output_control_ports[i]->prev_value, value))
+            if (! floats_differ_enough(port->prev_value, value))
                 continue;
 
             postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
@@ -1217,11 +1238,11 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
             if (posteventptr == NULL)
                 continue;
 
-            effect->output_control_ports[i]->prev_value = value;
+            port->prev_value = value;
 
             posteventptr->event.type = POSTPONED_OUTPUT_MONITOR;
             posteventptr->event.parameter.effect_id = effect->instance;
-            posteventptr->event.parameter.symbol    = effect->output_control_ports[i]->symbol;
+            posteventptr->event.parameter.symbol    = port->symbol;
             posteventptr->event.parameter.value     = value;
 
             pthread_mutex_lock(&g_rtsafe_mutex);
@@ -1229,6 +1250,39 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
             pthread_mutex_unlock(&g_rtsafe_mutex);
 
             needs_post = true;
+        }
+
+        for (i = 0; i < effect->output_event_ports_count; ++i)
+        {
+            if ((effect->output_event_ports[i]->hints & HINT_MONITORED) == 0)
+                continue;
+            port_t *port = effect->output_event_ports[i];
+
+            AtomWriter atomwriter;
+            atom_writer_init(&atomwriter, &g_lv2_atom_forge, &g_urid_unmap);
+
+            LV2_Evbuf_Iterator it;
+            for (it = lv2_evbuf_begin(port->evbuf); lv2_evbuf_is_valid(it); it = lv2_evbuf_next(it))
+            {
+                uint32_t frames, subframes, type, size;
+                uint8_t* body;
+                if (lv2_evbuf_get(it, &frames, &subframes, &type, &size, &body))
+                {
+                    if (atom_writer_format(&atomwriter, effect->instance, port->symbol, type, size, body))
+                    {
+                        ++atomwriter.len; // NULL terminated string
+                        if (jack_ringbuffer_write_space (g_atom_to_gui_rb) < atomwriter.len +  sizeof (size_t))
+                            continue;
+
+                        pthread_mutex_lock(&g_atom_to_gui_mutex);
+                        jack_ringbuffer_write(g_atom_to_gui_rb, (const char *)&atomwriter.len, sizeof (size_t));
+                        jack_ringbuffer_write(g_atom_to_gui_rb, (const char *)atomwriter.buf, atomwriter.len);
+                        pthread_mutex_unlock(&g_atom_to_gui_mutex);
+
+                        needs_post = true;
+                    }
+                }
+            }
         }
 
         if (needs_post)
@@ -1735,6 +1789,16 @@ static port_t *FindEffectOutputPortBySymbol(effect_t *effect, const char *contro
     return NULL;
 }
 
+static port_t *FindEffectOutputAtomPortBySymbol(effect_t *effect, const char *control_symbol)
+{
+    for (uint32_t i = 0; i < effect->output_event_ports_count; i++)
+    {
+        if (strcmp(effect->output_event_ports[i]->symbol, control_symbol) == 0)
+            return effect->output_event_ports[i];
+    }
+    return NULL;
+}
+
 static void SetParameterFromState(const char* symbol, void* user_data,
                                   const void* value, uint32_t size,
                                   uint32_t type)
@@ -2062,8 +2126,12 @@ int effects_init(void* client)
 
     pthread_mutex_init(&g_rtsafe_mutex, &atts);
     pthread_mutex_init(&g_midi_learning_mutex, &atts);
+    pthread_mutex_init(&g_atom_to_gui_mutex, &atts);
 
     pthread_mutexattr_destroy(&atts);
+
+    g_atom_to_gui_rb = jack_ringbuffer_create(MAX_ATOM_JSON * 32); /* 2MB */
+    jack_ringbuffer_mlock(g_atom_to_gui_rb);
 
     sem_init(&g_postevents_semaphore, 0, 0);
 
@@ -2395,8 +2463,10 @@ int effects_finish(int close_client)
     lilv_world_free(g_lv2_data);
     rtsafe_memory_pool_destroy(g_rtsafe_mem_pool);
     sem_destroy(&g_postevents_semaphore);
+    jack_ringbuffer_free(g_atom_to_gui_rb);
     pthread_mutex_destroy(&g_rtsafe_mutex);
     pthread_mutex_destroy(&g_midi_learning_mutex);
+    pthread_mutex_destroy(&g_atom_to_gui_mutex);
 
     effect_t *effect = &g_effects[GLOBAL_EFFECT_ID];
     if (effect->ports)
@@ -3744,6 +3814,9 @@ int effects_monitor_output_parameter(int effect_id, const char *control_symbol)
     port = FindEffectOutputPortBySymbol(&(g_effects[effect_id]), control_symbol);
 
     if (port == NULL)
+        port = FindEffectOutputAtomPortBySymbol(&(g_effects[effect_id]), control_symbol);
+
+    if (port == NULL)
         return ERR_LV2_INVALID_PARAM_SYMBOL;
 
     // check if already monitored
@@ -3751,7 +3824,9 @@ int effects_monitor_output_parameter(int effect_id, const char *control_symbol)
         return SUCCESS;
 
     // set prev_value
-    port->prev_value = (*port->buffer);
+    if (port->type == TYPE_CONTROL)
+        port->prev_value = (*port->buffer);
+
     port->hints |= HINT_MONITORED;
 
     // activate output monitor
