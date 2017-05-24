@@ -536,7 +536,6 @@ static void GetFeatures(effect_t *effect);
 static property_t *FindEffectPropertyByLabel(effect_t *effect, const char *label);
 static port_t *FindEffectInputPortBySymbol(effect_t *effect, const char *control_symbol);
 static port_t *FindEffectOutputPortBySymbol(effect_t *effect, const char *control_symbol);
-static port_t *FindEffectOutputAtomPortBySymbol(effect_t *effect, const char *control_symbol);
 static const void* GetPortValueForState(const char* symbol, void* user_data, uint32_t* size, uint32_t* type);
 static int LoadPresets(effect_t *effect);
 static void FreeFeatures(effect_t *effect);
@@ -1258,9 +1257,6 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
                 continue;
             port_t *port = effect->output_event_ports[i];
 
-            AtomWriter atomwriter;
-            atom_writer_init(&atomwriter, &g_lv2_atom_forge, &g_urid_unmap);
-
             LV2_Evbuf_Iterator it;
             for (it = lv2_evbuf_begin(port->evbuf); lv2_evbuf_is_valid(it); it = lv2_evbuf_next(it))
             {
@@ -1268,11 +1264,15 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
                 uint8_t* body;
                 if (lv2_evbuf_get(it, &frames, &subframes, &type, &size, &body))
                 {
-                    if (atom_writer_format(&atomwriter, effect->instance, port->symbol, type, size, body))
+                    AtomWriter atomwriter;
+                    atom_writer_init(&atomwriter, &g_lv2_atom_forge, &g_urid_unmap);
+
+                    if (atom_writer_format(&atomwriter, effect->instance, port->symbol, type, size, body) == 0)
                     {
                         ++atomwriter.len; // NULL terminated string
-                        if (jack_ringbuffer_write_space (g_atom_to_gui_rb) < atomwriter.len +  sizeof (size_t))
+                        if (jack_ringbuffer_write_space(g_atom_to_gui_rb) < atomwriter.len +  sizeof (size_t)) {
                             continue;
+                        }
 
                         pthread_mutex_lock(&g_atom_to_gui_mutex);
                         jack_ringbuffer_write(g_atom_to_gui_rb, (const char *)&atomwriter.len, sizeof (size_t));
@@ -1786,11 +1786,6 @@ static port_t *FindEffectOutputPortBySymbol(effect_t *effect, const char *contro
         if (strcmp(effect->output_control_ports[i]->symbol, control_symbol) == 0)
             return effect->output_control_ports[i];
     }
-    return NULL;
-}
-
-static port_t *FindEffectOutputAtomPortBySymbol(effect_t *effect, const char *control_symbol)
-{
     for (uint32_t i = 0; i < effect->output_event_ports_count; i++)
     {
         if (strcmp(effect->output_event_ports[i]->symbol, control_symbol) == 0)
@@ -3812,9 +3807,6 @@ int effects_monitor_output_parameter(int effect_id, const char *control_symbol)
         return ERR_INSTANCE_NON_EXISTS;
 
     port = FindEffectOutputPortBySymbol(&(g_effects[effect_id]), control_symbol);
-
-    if (port == NULL)
-        port = FindEffectOutputAtomPortBySymbol(&(g_effects[effect_id]), control_symbol);
 
     if (port == NULL)
         return ERR_LV2_INVALID_PARAM_SYMBOL;
