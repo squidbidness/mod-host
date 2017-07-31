@@ -468,6 +468,7 @@ static volatile double g_transport_bpb;
 static volatile double g_transport_bpm;
 static volatile bool g_transport_reset;
 static double g_transport_tick;
+static bool g_processing_enabled;
 
 /* LV2 and Lilv */
 static LilvWorld *g_lv2_data;
@@ -857,6 +858,28 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
     if (arg == NULL) return 0;
     effect = arg;
 
+    if (!g_processing_enabled)
+    {
+        port_t *port;
+        for (i = 0; i < effect->output_audio_ports_count; i++)
+        {
+            memset(jack_port_get_buffer(effect->output_audio_ports[i]->jack_port, nframes),
+                   0, (sizeof(float) * nframes));
+        }
+        for (i = 0; i < effect->output_cv_ports_count; i++)
+        {
+            memset(jack_port_get_buffer(effect->output_cv_ports[i]->jack_port, nframes),
+                   0, (sizeof(float) * nframes));
+        }
+        for (i = 0; i < effect->output_event_ports_count; i++)
+        {
+            port = effect->output_event_ports[i];
+            if (port->jack_port && port->flow == FLOW_OUTPUT && port->type == TYPE_EVENT)
+                jack_midi_clear_buffer(jack_port_get_buffer(port->jack_port, nframes));
+        }
+        return 0;
+    }
+
     /* transport */
     uint8_t pos_buf[256];
     LV2_Atom* lv2_pos = (LV2_Atom*)pos_buf;
@@ -1019,7 +1042,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
             const port_t *port = effect->ports[effect->control_index];
             LV2_Evbuf_Iterator e = lv2_evbuf_end(port->evbuf);
             const LV2_Atom* const ratom = (const LV2_Atom*)fatom;
-            lv2_evbuf_write(&e, nframes, 0, ratom->type, ratom->size,
+            lv2_evbuf_write(&e, nframes - 1, 0, ratom->type, ratom->size,
                                 LV2_ATOM_BODY_CONST(ratom));
         }
     }
@@ -1337,6 +1360,7 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
                 jack_transport_stop(g_jack_global_client);
                 jack_transport_locate(g_jack_global_client, 0);
             }
+            g_transport_reset = true;
         }
     }
     else
@@ -1350,20 +1374,28 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
             value /= 127.0f;
 
         // make sure bounds are correct
-        if (value < 0.0f)
-            value = 0.0f;
-        else if (value > 1.0f)
-            value = 1.0f;
-
-        // real value
-        if (port->hints & HINT_LOGARITHMIC)
+        if (value <= 0.0f)
         {
-            // FIXME: calculate value properly (don't do log on custom scale, use port min/max then adjust)
-            value = mcc->minimum * powf(mcc->maximum/mcc->minimum, value);
+            value = mcc->minimum;
+        }
+        else if (value >= 1.0f)
+        {
+            value = mcc->maximum;
         }
         else
         {
-            value = mcc->minimum + (mcc->maximum - mcc->minimum) * value;
+            if (port->hints & HINT_LOGARITHMIC)
+            {
+                // FIXME: calculate value properly (don't do log on custom scale, use port min/max then adjust)
+                value = mcc->minimum * powf(mcc->maximum/mcc->minimum, value);
+            }
+            else
+            {
+                value = mcc->minimum + (mcc->maximum - mcc->minimum) * value;
+            }
+
+            if (port->hints & HINT_INTEGER)
+                value = rintf(value);
         }
 
         if (mcc->effect_id == GLOBAL_EFFECT_ID)
@@ -1995,9 +2027,6 @@ static void CCDataUpdate(void* arg)
         // invert value if bypass
         if ((is_bypass = !strcmp(assignment->port->symbol, g_bypass_port_symbol)))
             data->value = 1.0f - data->value;
-        // force value to maximum if trigger
-        else if (assignment->port->hints & HINT_TRIGGER)
-            data->value = assignment->port->max_value;
 
         // ignore requests for same value
         if (!floats_differ_enough(*(assignment->port->buffer), data->value))
@@ -2030,6 +2059,7 @@ static void CCDataUpdate(void* arg)
                     jack_transport_stop(g_jack_global_client);
                     jack_transport_locate(g_jack_global_client, 0);
                 }
+                g_transport_reset = true;
             }
         }
 
@@ -2115,7 +2145,7 @@ int effects_init(void* client)
 
     pthread_mutexattr_t atts;
     pthread_mutexattr_init(&atts);
-#ifdef __ARM_ARCH_7A__
+#ifdef __MOD_DEVICES__
     pthread_mutexattr_setprotocol(&atts, PTHREAD_PRIO_INHERIT);
 #endif
 
@@ -2429,6 +2459,8 @@ int effects_init(void* client)
         jack_free(midihwports);
     }
 
+    g_processing_enabled = true;
+
     return SUCCESS;
 
     UNUSED_PARAM(global_effect_id_static_check);
@@ -2475,6 +2507,8 @@ int effects_finish(int close_client)
     hylia_cleanup(g_hylia_instance);
     g_hylia_instance = NULL;
 #endif
+
+    g_processing_enabled = false;
 
     return SUCCESS;
 }
@@ -3299,9 +3333,8 @@ int effects_preset_load(int effect_id, const char *uri)
     if (InstanceExist(effect_id))
     {
         LilvNode* preset_uri = lilv_new_uri(g_lv2_data, uri);
-        effect = &g_effects[effect_id];
 
-        if (lilv_world_load_resource(g_lv2_data, preset_uri) >= 0)
+        if (preset_uri && lilv_world_load_resource(g_lv2_data, preset_uri) >= 0)
         {
             LilvState* state = lilv_state_new_from_world(g_lv2_data, &g_urid_map, preset_uri);
             if (!state)
@@ -3309,6 +3342,9 @@ int effects_preset_load(int effect_id, const char *uri)
                 lilv_node_free(preset_uri);
                 return ERR_LV2_CANT_LOAD_STATE;
             }
+
+            effect = &g_effects[effect_id];
+
             lilv_state_restore(state, effect->lilv_instance, SetParameterFromState, effect, 0, NULL);
             lilv_state_free(state);
             lilv_node_free(preset_uri);
@@ -3483,6 +3519,9 @@ int effects_remove(int effect_id)
             free(effect->input_audio_ports);
             free(effect->output_audio_ports);
             free(effect->control_ports);
+            if (effect->events_buffer) {
+                jack_ringbuffer_free (effect->events_buffer);
+            }
 
             if (effect->presets)
             {
@@ -4215,8 +4254,7 @@ int effects_cc_map(int effect_id, const char *control_symbol, int device_id, int
 
         if (assignment.list_items != NULL && item_data != NULL)
         {
-            // FIXME: allow CC_MODE_TOGGLE|CC_MODE_OPTIONS
-            assignment.mode = CC_MODE_OPTIONS;
+            assignment.mode |= CC_MODE_OPTIONS;
 
             for (int i = 0; i < scalepoints_count; i++)
             {
@@ -4424,6 +4462,17 @@ int effects_link_enable(int enable)
 #endif
 
     return ERR_LINK_UNAVAILABLE;
+}
+
+int effects_processing_enable(int enable)
+{
+    g_processing_enabled = enable;
+
+    if (enable > 1) {
+        effects_output_data_ready();
+    }
+
+    return SUCCESS;
 }
 
 void effects_transport(int rolling, double beats_per_bar, double beats_per_minute)
