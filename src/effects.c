@@ -1134,15 +1134,15 @@ static int Process(jack_nframes_t nframes, void *arg)
     // Capture input
     for (int i = 0; i < IN_PORT_COUNT; i++)
     {
-        jack_default_audio_sample_t *external = jack_port_get_buffer(g_in_ports[i], nframes);
-        jack_default_audio_sample_t *internal = jack_port_get_buffer(g_in_ports_internal[i], nframes);
-        memcpy(external, internal, sizeof(jack_default_audio_sample_t) * nframes);
+        float *external = jack_port_get_buffer(g_in_ports[i], nframes);
+        float *internal = jack_port_get_buffer(g_in_ports_internal[i], nframes);
+        memcpy(external, internal, sizeof(float) * nframes);
     }
     // Send output
     for (int i = 0; i < OUT_PORT_COUNT; i++) {
-        jack_default_audio_sample_t *internal = jack_port_get_buffer(g_out_ports_internal[i], nframes);
-        jack_default_audio_sample_t *external = jack_port_get_buffer(g_out_ports[i], nframes);
-        memcpy(internal, external, sizeof(jack_default_audio_sample_t) * nframes);
+        float *internal = jack_port_get_buffer(g_out_ports_internal[i], nframes);
+        float *external = jack_port_get_buffer(g_out_ports[i], nframes);
+        memcpy(internal, external, sizeof(float) * nframes);
     }
 
     void *const port_buf = jack_port_get_buffer(g_midi_in_port, nframes);
