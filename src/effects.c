@@ -362,6 +362,8 @@ typedef struct POSTPONED_CACHED_EVENTS {
 
 #define UNUSED_PARAM(var)           do { (void)(var); } while (0)
 #define INSTANCE_IS_VALID(id)       ((id >= 0) && (id < MAX_INSTANCES))
+#define IN_PORT_COUNT               2
+#define OUT_PORT_COUNT              2
 
 
 /*
@@ -391,7 +393,16 @@ static pthread_t     g_postevents_thread;
 /* Jack */
 static jack_client_t *g_jack_global_client;
 static jack_nframes_t g_sample_rate, g_block_length;
-static const char **g_capture_ports, **g_playback_ports;
+static jack_port_t *g_in_ports_internal[IN_PORT_COUNT], *g_out_ports_internal[OUT_PORT_COUNT];
+static jack_port_t *g_in_ports[IN_PORT_COUNT], *g_out_ports[OUT_PORT_COUNT];
+static const char *g_in_ports_internal_prefix = "capture_internal";
+static const char *g_out_ports_internal_prefix = "playback_internal";
+static const char *g_in_ports_prefix = "capture";
+static const char *g_out_ports_prefix = "playback";
+static const char *g_in_ports_path_internal_prefix = "/graph/capture_internal";
+static const char *g_out_ports_path_internal_prefix = "/graph/playback_internal";
+static const char *g_in_ports_path_prefix = "/graph/capture";
+static const char *g_out_ports_path_prefix = "/graph/playback";
 static size_t g_midi_buffer_size;
 static jack_port_t *g_midi_in_port;
 
@@ -443,7 +454,7 @@ static void RunPostPonedEvents(int ignored_effect_id);
 static void* PostPonedEventsThread(void* arg);
 static int ProcessPlugin(jack_nframes_t nframes, void *arg);
 static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres);
-static int ProcessMidi(jack_nframes_t nframes, void *arg);
+static int Process(jack_nframes_t nframes, void *arg);
 static void JackThreadInit(void *arg);
 static void GetFeatures(effect_t *effect);
 static property_t *FindEffectPropertyByLabel(effect_t *effect, const char *label);
@@ -1112,13 +1123,27 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
     }
 }
 
-static int ProcessMidi(jack_nframes_t nframes, void *arg)
+static int Process(jack_nframes_t nframes, void *arg)
 {
     jack_midi_event_t event;
     uint8_t channel, controller, status;
     uint16_t mvalue;
     float value;
     bool handled, highres, needs_post = false;
+
+    // Capture input
+    for (int i = 0; i < IN_PORT_COUNT; i++)
+    {
+        jack_default_audio_sample_t *external = jack_port_get_buffer(g_in_ports[i], nframes);
+        jack_default_audio_sample_t *internal = jack_port_get_buffer(g_in_ports_internal[i], nframes);
+        memcpy(external, internal, sizeof(jack_default_audio_sample_t) * nframes);
+    }
+    // Send output
+    for (int i = 0; i < OUT_PORT_COUNT; i++) {
+        jack_default_audio_sample_t *internal = jack_port_get_buffer(g_out_ports_internal[i], nframes);
+        jack_default_audio_sample_t *external = jack_port_get_buffer(g_out_ports[i], nframes);
+        memcpy(internal, external, sizeof(jack_default_audio_sample_t) * nframes);
+    }
 
     void *const port_buf = jack_port_get_buffer(g_midi_in_port, nframes);
     const jack_nframes_t event_count = jack_midi_get_event_count(port_buf);
@@ -1644,6 +1669,14 @@ static void InitializeControlChainIfNeeded(void)
 }
 #endif
 
+static void PortRegisterErrorMsg( const char *portname )
+{
+    char err_msg[MAX_CHAR_BUF_SIZE];
+    snprintf(err_msg, MAX_CHAR_BUF_SIZE, "can't register mod-host jack port %s", portname);
+    fprintf(stderr, "%s\n", err_msg);
+}
+
+
 /*
 ************************************************************************************************************************
 *           GLOBAL FUNCTIONS
@@ -1700,19 +1733,64 @@ int effects_init(void* client)
     }
     */
 
-    /* Get the system ports */
-    g_capture_ports = jack_get_ports(g_jack_global_client, "system", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput);
-    g_playback_ports = jack_get_ports(g_jack_global_client, "system", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput);
-
     /* Get buffers size */
     g_block_length = jack_get_buffer_size(g_jack_global_client);
     g_midi_buffer_size = jack_port_type_get_buffer_size(g_jack_global_client, JACK_DEFAULT_MIDI_TYPE);
 
     /* Set jack callbacks */
     jack_set_thread_init_callback(g_jack_global_client, JackThreadInit, NULL);
-    jack_set_process_callback(g_jack_global_client, ProcessMidi, NULL);
+    jack_set_process_callback(g_jack_global_client, Process, NULL);
 
-    /* Register jack ports */
+    /* Register mod-host jack ports */
+    for (int i=0; i<IN_PORT_COUNT; i++)
+    {
+        char portname[MAX_CHAR_BUF_SIZE];
+
+        snprintf(portname, MAX_CHAR_BUF_SIZE, "%s_%i", g_in_ports_prefix, i+1);
+        g_in_ports[i] = jack_port_register(g_jack_global_client, portname, JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
+        if (! g_in_ports[i] )
+        {
+            PortRegisterErrorMsg(portname);
+            if (client == NULL)
+                jack_client_close(g_jack_global_client);
+            return ERR_JACK_PORT_REGISTER;
+        }
+
+        snprintf(portname, MAX_CHAR_BUF_SIZE, "%s_%i", g_in_ports_internal_prefix, i+1);
+        g_in_ports_internal[i] = jack_port_register(g_jack_global_client, portname, JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
+        if (! g_in_ports_internal[i] )
+        {
+            PortRegisterErrorMsg(portname);
+            if (client == NULL)
+                jack_client_close(g_jack_global_client);
+            return ERR_JACK_PORT_REGISTER;
+        }
+    }
+    for (int i=0; i<OUT_PORT_COUNT; i++)
+    {
+        char portname[MAX_CHAR_BUF_SIZE];
+
+        snprintf(portname, MAX_CHAR_BUF_SIZE, "%s_%i", g_out_ports_prefix, i+1);
+        g_out_ports[i] = jack_port_register(g_jack_global_client, portname, JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
+        if (! g_out_ports[i] )
+        {
+            PortRegisterErrorMsg(portname);
+            if (client == NULL)
+                jack_client_close(g_jack_global_client);
+            return ERR_JACK_PORT_REGISTER;
+        }
+
+        snprintf(portname, MAX_CHAR_BUF_SIZE, "%s_%i", g_out_ports_internal_prefix, i+1);
+        g_out_ports_internal[i] = jack_port_register(g_jack_global_client, portname, JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
+        if (! g_out_ports_internal[i] )
+        {
+            PortRegisterErrorMsg(portname);
+            if (client == NULL)
+                jack_client_close(g_jack_global_client);
+            return ERR_JACK_PORT_REGISTER;
+        }
+    }
+
     g_midi_in_port = jack_port_register(g_jack_global_client, "midi_in", JACK_DEFAULT_MIDI_TYPE, JackPortIsInput, 0);
 
     if (! g_midi_in_port)
@@ -1730,32 +1808,6 @@ int effects_init(void* client)
         if (client == NULL)
             jack_client_close(g_jack_global_client);
         return ERR_JACK_CLIENT_ACTIVATION;
-    }
-
-    /* Connect to all good hw ports (system, ttymidi and nooice) */
-    const char** const midihwports = jack_get_ports(g_jack_global_client, "", JACK_DEFAULT_MIDI_TYPE,
-                                                                              JackPortIsOutput|JackPortIsPhysical);
-    if (midihwports != NULL)
-    {
-        char ourportname[MAX_CHAR_BUF_SIZE+1];
-        ourportname[MAX_CHAR_BUF_SIZE] = '\0';
-
-        const char* const ourclientname = jack_get_client_name(g_jack_global_client);
-
-        snprintf(ourportname, MAX_CHAR_BUF_SIZE, "%s:midi_in", ourclientname);
-
-        for (int i=0; midihwports[i] != NULL; ++i)
-        {
-            const char* const portname = midihwports[i];
-            if (strncmp(portname, "ttymidi:", 8) != 0 &&
-                strncmp(portname, "system:", 7) != 0 &&
-                strncmp(portname, "nooice", 5) != 0)
-                continue;
-
-            jack_connect(g_jack_global_client, portname, ourportname);
-        }
-
-        jack_free(midihwports);
     }
 
     /* Load all LV2 data */
@@ -1906,8 +1958,6 @@ int effects_finish(int close_client)
     }
 #endif
 
-    if (g_capture_ports) jack_free(g_capture_ports);
-    if (g_playback_ports) jack_free(g_playback_ports);
     if (close_client) jack_client_close(g_jack_global_client);
     symap_free(g_symap);
     lilv_node_free(g_sample_rate_node);
@@ -2785,27 +2835,6 @@ int effects_remove(int effect_id)
 
     if (effect_id == REMOVE_ALL)
     {
-        /* Disconnect the system connections */
-        if (g_capture_ports != NULL)
-        {
-            for (i = 0; g_capture_ports[i]; i++)
-            {
-                const char **capture_connections =
-                    jack_port_get_connections(jack_port_by_name(g_jack_global_client, g_capture_ports[i]));
-
-                if (capture_connections)
-                {
-                    for (j = 0; capture_connections[j]; j++)
-                    {
-                        if (strstr(capture_connections[j], "system"))
-                            jack_disconnect(g_jack_global_client, g_capture_ports[i], capture_connections[j]);
-                    }
-
-                    jack_free(capture_connections);
-                }
-            }
-        }
-
         start = 0;
         end = MAX_INSTANCES - 10; // TODO: better way to exclude the Tools (10)
     }
